@@ -104,6 +104,197 @@ Sonnet 4.6 says:
 
 ---
 
+## Finding the Wakelock Holder
+
+Before we start, do note that C0/C1/C2 states are activated by the kernel automatically and the kernel can have the CPU
+go in and out of the states based on interrupts. However, Suspend-2-RAM likely needs to be initiated from userspace.
+
+### Step 1: Establish ground truth: did the kernel ever suspend?
+```
+sudo cat /sys/power/suspend_stats/success
+```
+Returned **0** across 9 hours. Device never suspended. This was the first hard signal something was wrong.
+
+### Step 2: Rule out kernel-level wakelocks
+```
+sudo cat /sys/power/wake_lock
+```
+Returned **nothing**. No kernel (partial) wakelock held. Pushed the problem up to the Android layer.
+
+### Step 3: Rule out driver rejection
+```
+sudo cat /sys/power/suspend_stats/failed_suspend
+sudo cat /sys/power/suspend_stats/last_failed_dev
+```
+Returned **0** and **nothing** respectively. Not a driver vetoing suspend. Combined with step 1: Android **never even tried** to suspend. Problem is likely in PowerManager.
+
+### Step 4: Check Android's power state
+
+```
+adb shell dumpsys power | grep -E "mWakefulness|mHoldingDisplaySuspendBlocker|mStayOn"
+```
+
+Returned:
+```
+  mWakefulness=Dozing
+  mWakefulnessChanging=false
+  mStayOn=false
+  mHoldingDisplaySuspendBlocker=false
+  mStayOnWhilePluggedInSetting=0
+```
+Of these, `mWakefulness=Dozing` and other flags false. Confirms that Android was in Doze but never handing off to kernel. Doze is further confirmed from `adb shell dumpsys deviceidle`:
+
+Idling history:
+```
+      deep-idle: -10h22m23s371ms
+     deep-maint: -9h22m23s364ms
+      deep-idle: -9h21m53s309ms
+     deep-maint: -7h21m53s298ms
+      deep-idle: -7h21m23s247ms
+     deep-maint: -3h21m23s242ms
+      deep-idle: -3h20m53s158ms
+```
+
+Other flags:
+```
+  mLightEnabled=true
+  mDeepEnabled=true
+  mForceIdle=false
+  mUseMotionSensor=true
+  mMotionSensor={Sensor name="sns_smd  Wakeup", vendor="qualcomm", version=1, type=17, maxRange=1.0, resolution=1.0, power=0.025, minDelay=-1}
+  mScreenOn=false
+  mScreenLocked=true
+  mNetworkConnected=true
+  mCharging=false
+  activeEmergencyCall=false
+  mMotionActive=false
+  mNotMoving=false
+  mMotionListener.activatedTimeElapsed=0
+  mLastMotionEventElapsed=0
+
+  0 stationary listeners registered
+  Location prefetching disabled
+
+  mState=IDLE
+  mLightState=OVERRIDE
+  mInactiveTimeout=+15s0ms
+  mNextAlarmTime=+2h39m6s841ms
+  mNextIdlePendingDelay=+10m0s0ms
+  mNextIdleDelay=+6h0m0s0ms
+  mNextLightIdleDelay=+5m0s0ms (flex=+1m0s0ms)
+  mCurLightIdleBudget=+1m0s0ms
+  mMaintenanceStartTime=-3h21m23s242ms
+```
+
+### Step 5: Find the actual holder
+
+```
+adb shell dumpsys power | grep -A 10 "Wake Locks:"
+```
+
+Returned:
+```
+Wake Locks: size=1
+  DOZE_WAKE_LOCK                    'dream:doze' ACQ=-10h51m29s812ms (uid=1000 pid=2135)
+
+Suspend Blockers: size=5
+  PowerManagerService.Booting: ref count=0 []
+  PowerManagerService.WakeLocks: ref count=0 []
+  PowerManagerService.Display: ref count=0 []
+  PowerManagerService.Broadcasts: ref count=0 []
+  PowerManagerService.WirelessChargerDetector: ref count=0 []
+
+Display Power: com.android.server.power.PowerManagerService$1@ce9bf18
+
+Battery saving stats:
+  Battery Saver is currently: ON
+    Last ON time: 2026-10-10 05:26:19.759 -11h1m30s719ms
+    Times full enabled: 1
+    Times adaptive enabled: 0
+  
+  Drain stats:
+                     Battery saver OFF                          ON
+  NonDoze NonIntr:      0m      0mAh(  0%)      0.0mAh/h          3m      0mAh(  0%)      0.0mAh/h
+             Intr:      0m      0mAh(  0%)      0.0mAh/h         10m      0mAh(  0%)      0.0mAh/h
+  Deep    NonIntr:      0m      0mAh(  0%)      0.0mAh/h        419m      0mAh(  0%)      0.0mAh/h
+             Intr:      0m      0mAh(  0%)      0.0mAh/h          0m      0mAh(  0%)      0.0mAh/h
+  Light   NonIntr:      0m      0mAh(  0%)      0.0mAh/h          0m      0mAh(  0%)      0.0mAh/h
+             Intr:      0m      0mAh(  0%)      0.0mAh/h          0m      0mAh(  0%)      0.0mAh/h
+
+Battery saver policy (*NOTE* they only apply when battery saver is ON):
+  Settings: battery_saver_constants
+    value: 
+  Settings: (overlay)
+```
+
+Observe, **`DOZE_WAKE_LOCK 'dream:doze' ACQ=-10h51m uid=1000`** held the entire run, lkely by the Android system itself. Never released in the middle.
+
+The output also showed `Suspend Blockers: size=5` with all at `ref count=0`. This is **not** a contradiction as those 5 are pre-registered structural slots in
+PowerManagerService (Booting, WakeLocks, Display, Broadcasts, WirelessChargerDetector), declared at boot and sitting empty. `DOZE_WAKE_LOCK` is a different type,
+acquired via `PowerManager.newWakeLock(DOZE_WAKE_LOCK)` and deliberately sits outside the suspend blocker accounting. So all 5 blockers at ref count=0 actually
+**reinforced** that Android never initiated suspend: none of its own internal gates were raised, yet suspend never happened, meaning the blocker was somewhere
+the normal accounting doesn't surface.
+
+### Step 6: Find root cause
+```
+adb shell dumpsys deviceidle | grep -E "mNetworkConnected|mLightState|mState"
+```
+
+See the output in `Step 4`, `mNetworkConnected=true` and `mLightState=OVERRIDE`. Chances are (according to Claude Sonnet 4.6), doze was intentionally suppressing
+suspend while network is active. But this has not been confirmed and needs further experiments.
+
+### Note
+
+To enable suspend, you can `echo mem > /sys/power/state` (or some other sysfs command).
+
+---
+
+## The kernel does not self-suspend
+
+This is the core misconception worth clearing up. The kernel has no autonomous "I've been idle long enough, I'll suspend
+now" logic. Android has to initiate it via **PowerManagerService**, (via a native thread called `SuspendThread` or
+`autosuspend` thread in older HALs).
+
+The ~93% C0 WFI the logs is the kernel idling between interrupts: that's automatic. But S2R requires a deliberate
+userspace action.
+
+```
+Kernel idle loop (C0 WFI)   ←  kernel does this autonomously
+        ≠
+Kernel suspend (S2R / mem)  ←  requires userspace to explicitly trigger it
+```
+
+### The gate sequence PowerManagerService uses
+
+If (and this is conjecture at this point), for suspend to happen, PMS works through this chain internally:
+
+```
+1. mWakefulness == Asleep (not Dozing, not Awake)
+        AND
+2. All suspend blockers at ref count=0
+        AND
+3. No DOZE_WAKE_LOCK held (i.e. Doze dream not in control)
+        AND
+4. wakeup_count handshake succeeds (race-free suspend check)
+        │
+        ▼
+   autosuspend thread writes "mem" → /sys/power/state
+        │
+        ▼
+   Kernel enters S2R
+```
+
+Then in our case however, Gate 3 failed as `DOZE_WAKE_LOCK` was held for 11 hours, keeping `mWakefulness=Dozing` instead
+of transitioning to `Asleep`. PMS's autosuspend thread never got a green light to write to `/sys/power/state`, i.e. the
+kernel was never asked to suspend.
+
+### Why Android did not suspend?
+
+We can only guess, but `mNetworkConnected=true` is a plausible contributing factor as network connectivity is known to
+affect Doze behaviour.
+
+---
+
 ## Enabling Suspend-2-RAM
 
 ### Find out supported power states:
@@ -445,195 +636,3 @@ sudo cat /sys/power/suspend_stats/success
 ```
 
 Returns a count of `1`.
-
----
-
-## Finding the Wakelock Holder
-
-Before we start, do note that C0/C1/C2 states are activated by the kernel automatically and the kernel can have the CPU
-go in and out of the states based on interrupts. However, Suspend-2-RAM likely needs to be initiated from userspace.
-
-### Step 1: Establish ground truth: did the kernel ever suspend?
-```
-sudo cat /sys/power/suspend_stats/success
-```
-Returned **0** across 9 hours. Device never suspended. This was the first hard signal something was wrong.
-
-### Step 2: Rule out kernel-level wakelocks
-```
-sudo cat /sys/power/wake_lock
-```
-Returned **nothing**. No kernel (partial) wakelock held. Pushed the problem up to the Android layer.
-
-### Step 3: Rule out driver rejection
-```
-sudo cat /sys/power/suspend_stats/failed_suspend
-sudo cat /sys/power/suspend_stats/last_failed_dev
-```
-Returned **0** and **nothing** respectively. Not a driver vetoing suspend. Combined with step 1: Android **never even tried** to suspend. Problem is likely in PowerManager.
-
-### Step 4: Check Android's power state
-
-```
-adb shell dumpsys power | grep -E "mWakefulness|mHoldingDisplaySuspendBlocker|mStayOn"
-```
-
-Returned:
-```
-  mWakefulness=Dozing
-  mWakefulnessChanging=false
-  mStayOn=false
-  mHoldingDisplaySuspendBlocker=false
-  mStayOnWhilePluggedInSetting=0
-```
-Of these, `mWakefulness=Dozing` and other flags false. Confirms that Android was in Doze but never handing off to kernel. Doze is further confirmed from `adb shell dumpsys deviceidle`:
-
-Idling history:
-```
-      deep-idle: -10h22m23s371ms
-     deep-maint: -9h22m23s364ms
-      deep-idle: -9h21m53s309ms
-     deep-maint: -7h21m53s298ms
-      deep-idle: -7h21m23s247ms
-     deep-maint: -3h21m23s242ms
-      deep-idle: -3h20m53s158ms
-```
-
-Other flags:
-```
-  mLightEnabled=true
-  mDeepEnabled=true
-  mForceIdle=false
-  mUseMotionSensor=true
-  mMotionSensor={Sensor name="sns_smd  Wakeup", vendor="qualcomm", version=1, type=17, maxRange=1.0, resolution=1.0, power=0.025, minDelay=-1}
-  mScreenOn=false
-  mScreenLocked=true
-  mNetworkConnected=true
-  mCharging=false
-  activeEmergencyCall=false
-  mMotionActive=false
-  mNotMoving=false
-  mMotionListener.activatedTimeElapsed=0
-  mLastMotionEventElapsed=0
-
-  0 stationary listeners registered
-  Location prefetching disabled
-
-  mState=IDLE
-  mLightState=OVERRIDE
-  mInactiveTimeout=+15s0ms
-  mNextAlarmTime=+2h39m6s841ms
-  mNextIdlePendingDelay=+10m0s0ms
-  mNextIdleDelay=+6h0m0s0ms
-  mNextLightIdleDelay=+5m0s0ms (flex=+1m0s0ms)
-  mCurLightIdleBudget=+1m0s0ms
-  mMaintenanceStartTime=-3h21m23s242ms
-```
-
-### Step 5: Find the actual holder
-
-```
-adb shell dumpsys power | grep -A 10 "Wake Locks:"
-```
-
-Returned:
-```
-Wake Locks: size=1
-  DOZE_WAKE_LOCK                    'dream:doze' ACQ=-10h51m29s812ms (uid=1000 pid=2135)
-
-Suspend Blockers: size=5
-  PowerManagerService.Booting: ref count=0 []
-  PowerManagerService.WakeLocks: ref count=0 []
-  PowerManagerService.Display: ref count=0 []
-  PowerManagerService.Broadcasts: ref count=0 []
-  PowerManagerService.WirelessChargerDetector: ref count=0 []
-
-Display Power: com.android.server.power.PowerManagerService$1@ce9bf18
-
-Battery saving stats:
-  Battery Saver is currently: ON
-    Last ON time: 2026-10-10 05:26:19.759 -11h1m30s719ms
-    Times full enabled: 1
-    Times adaptive enabled: 0
-  
-  Drain stats:
-                     Battery saver OFF                          ON
-  NonDoze NonIntr:      0m      0mAh(  0%)      0.0mAh/h          3m      0mAh(  0%)      0.0mAh/h
-             Intr:      0m      0mAh(  0%)      0.0mAh/h         10m      0mAh(  0%)      0.0mAh/h
-  Deep    NonIntr:      0m      0mAh(  0%)      0.0mAh/h        419m      0mAh(  0%)      0.0mAh/h
-             Intr:      0m      0mAh(  0%)      0.0mAh/h          0m      0mAh(  0%)      0.0mAh/h
-  Light   NonIntr:      0m      0mAh(  0%)      0.0mAh/h          0m      0mAh(  0%)      0.0mAh/h
-             Intr:      0m      0mAh(  0%)      0.0mAh/h          0m      0mAh(  0%)      0.0mAh/h
-
-Battery saver policy (*NOTE* they only apply when battery saver is ON):
-  Settings: battery_saver_constants
-    value: 
-  Settings: (overlay)
-```
-
-Observe, **`DOZE_WAKE_LOCK 'dream:doze' ACQ=-10h51m uid=1000`** held the entire run, lkely by the Android system itself. Never released in the middle.
-
-The output also showed `Suspend Blockers: size=5` with all at `ref count=0`. This is **not** a contradiction as those 5 are pre-registered structural slots in
-PowerManagerService (Booting, WakeLocks, Display, Broadcasts, WirelessChargerDetector), declared at boot and sitting empty. `DOZE_WAKE_LOCK` is a different type,
-acquired via `PowerManager.newWakeLock(DOZE_WAKE_LOCK)` and deliberately sits outside the suspend blocker accounting. So all 5 blockers at ref count=0 actually
-**reinforced** that Android never initiated suspend: none of its own internal gates were raised, yet suspend never happened, meaning the blocker was somewhere
-the normal accounting doesn't surface.
-
-### Step 6: Find root cause
-```
-adb shell dumpsys deviceidle | grep -E "mNetworkConnected|mLightState|mState"
-```
-
-See the output in `Step 4`, `mNetworkConnected=true` and `mLightState=OVERRIDE`. Chances are (according to Claude Sonnet 4.6), doze was intentionally suppressing
-suspend while network is active. But this has not been confirmed and needs further experiments.
-
-### Note
-
-To enable suspend, you can `echo mem > /sys/power/state` (or some other sysfs command).
-
----
-
-## The kernel does not self-suspend
-
-This is the core misconception worth clearing up. The kernel has no autonomous "I've been idle long enough, I'll suspend
-now" logic. Android has to initiate it via **PowerManagerService**, (via a native thread called `SuspendThread` or
-`autosuspend` thread in older HALs).
-
-The ~93% C0 WFI the logs is the kernel idling between interrupts: that's automatic. But S2R requires a deliberate
-userspace action.
-
-```
-Kernel idle loop (C0 WFI)   ←  kernel does this autonomously
-        ≠
-Kernel suspend (S2R / mem)  ←  requires userspace to explicitly trigger it
-```
-
-### The gate sequence PowerManagerService uses
-
-If (and this is conjecture at this point), for suspend to happen, PMS works through this chain internally:
-
-```
-1. mWakefulness == Asleep (not Dozing, not Awake)
-        AND
-2. All suspend blockers at ref count=0
-        AND
-3. No DOZE_WAKE_LOCK held (i.e. Doze dream not in control)
-        AND
-4. wakeup_count handshake succeeds (race-free suspend check)
-        │
-        ▼
-   autosuspend thread writes "mem" → /sys/power/state
-        │
-        ▼
-   Kernel enters S2R
-```
-
-Then in our case however, Gate 3 failed as `DOZE_WAKE_LOCK` was held for 11 hours, keeping `mWakefulness=Dozing` instead
-of transitioning to `Asleep`. PMS's autosuspend thread never got a green light to write to `/sys/power/state`, i.e. the
-kernel was never asked to suspend.
-
-### Why Android did not suspend?
-
-We can only guess, but `mNetworkConnected=true` is a plausible contributing factor as network connectivity is known to
-affect Doze behaviour.
-
