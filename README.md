@@ -3,6 +3,10 @@
 **TL;DR**: Mine does not. So you don't need to hold a partial wakelock on termux for long running tasks.
 Just using unrestricted battery is enough to prevent `deep-idle` from halting your process group.
 
+Why Android doesn't suspend? It is highly likely Android sees active USB or Ethernet and does not suspend.
+Even if it tried, the USB driver will not allow it. Either that, or given how buggy forcing suspend was,
+its probably supported but never used by this ROM.
+
 ## Device & ROM
 
 - Redmi Note 9 Pro (India): Miatoll/Curtana
@@ -126,7 +130,8 @@ Returned **nothing**. No kernel (partial) wakelock held. Pushed the problem up t
 sudo cat /sys/power/suspend_stats/failed_suspend
 sudo cat /sys/power/suspend_stats/last_failed_dev
 ```
-Returned **0** and **nothing** respectively. Not a driver vetoing suspend. Combined with step 1: Android **never even tried** to suspend. Problem is likely in PowerManager.
+Returned **0** and **nothing** respectively. Not a driver vetoing suspend. Combined with step 1: Android **never
+even tried** to suspend. Problem is likely in PowerManager.
 
 ### Step 4: Check Android's power state
 
@@ -142,7 +147,8 @@ Returned:
   mHoldingDisplaySuspendBlocker=false
   mStayOnWhilePluggedInSetting=0
 ```
-Of these, `mWakefulness=Dozing` and other flags false. Confirms that Android was in Doze but never handing off to kernel. Doze is further confirmed from `adb shell dumpsys deviceidle`:
+Of these, `mWakefulness=Dozing` and other flags false. Confirms that Android was in Doze but never handing off to kernel.
+Doze is further confirmed from `adb shell dumpsys deviceidle`:
 
 Idling history:
 ```
@@ -292,6 +298,10 @@ kernel was never asked to suspend.
 
 We can only guess, but `mNetworkConnected=true` is a plausible contributing factor as network connectivity is known to
 affect Doze behaviour.
+
+**EDIT**: From the following (Enabling S2R), it is highly likely Android sees active USB or Ethernet and does not suspend.
+Even if it tried, the USB driver will not allow it. Either that, or given how buggy forcing suspend was, its probably
+supported but never used by this ROM.
 
 ---
 
